@@ -1,0 +1,15 @@
+streamlit
+pandas>=3.0
+numpy
+plotly
+pypsa
+linopy
+xarray>=2025.1.0
+netcdf4
+highspy
+scipy
+matplotlib
+fastapi
+uvicorn
+pydantic
+sqlalchemy

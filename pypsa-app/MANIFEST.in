@@ -1,0 +1,22 @@
+# Include static frontend files
+graft src/pypsa_app/backend/static
+
+# Include documentation
+include README.md
+include LICENSE
+include *.md
+
+# Exclude development files
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *.swo
+
+# Exclude build artifacts
+prune frontend/node_modules
+prune frontend/build
+prune backend
+prune data
+prune .venv
+prune dist

@@ -1,0 +1,17 @@
+# Git worktrees and claude state
+.claude/
+
+# Node modules (npm ci runs in Docker)
+**/node_modules/
+
+# Build outputs
+**/build/
+**/.svelte-kit/
+
+# Data
+data/
+
+# Dev files
+*.md
+.pre-commit-config.yaml
+.gitignore

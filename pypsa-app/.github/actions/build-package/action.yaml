@@ -1,0 +1,9 @@
+name: Build pypsa-app package
+description: Build python package with bundled frontend
+
+runs:
+  using: composite
+  steps:
+  - name: Build and inspect Python package
+    id: baipp
+    uses: hynek/build-and-inspect-python-package@ebd3b6c6d32b78607276633a23bdd4481bd23ca8   # v2.18.0

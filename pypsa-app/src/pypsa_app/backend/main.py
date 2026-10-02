@@ -1,0 +1,381 @@
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy import select, text
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import Response
+
+from pypsa_app.backend.__version__ import __description__, __version__
+from pypsa_app.backend.alembic import run_migrations
+from pypsa_app.backend.api.routes import (
+    admin,
+    api_keys,
+    auth,
+    cache,
+    networks,
+    networks_remote,
+    plots,
+    public,
+    runs,
+    statistics,
+    tasks,
+    version,
+)
+from pypsa_app.backend.auth import session
+from pypsa_app.backend.auth.authenticate import (
+    ensure_demo_user,
+    ensure_system_user,
+    resolve_current_user,
+)
+from pypsa_app.backend.auth.providers import build_oauth_clients
+from pypsa_app.backend.cache import cache_service
+from pypsa_app.backend.database import SessionLocal, engine
+from pypsa_app.backend.models import SnakedispatchBackend
+from pypsa_app.backend.ratelimit import (
+    APIRateLimitMiddleware,
+    limiter,
+    rate_limit_exceeded_handler,
+)
+from pypsa_app.backend.services.backend_registry import backend_registry
+from pypsa_app.backend.services.run import SnakedispatchError
+from pypsa_app.backend.services.sync import run_sync_loop
+from pypsa_app.backend.settings import API_V1_PREFIX, SESSION_COOKIE_NAME, settings
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _sync_backends() -> None:
+    """Upsert backends from settings into the DB and populate the registry."""
+    configured = {b["name"]: b["url"] for b in settings.resolved_backends}
+    db = SessionLocal()
+    try:
+        for backend in db.scalars(select(SnakedispatchBackend)).all():
+            if backend.name in configured:
+                backend.url = configured.pop(backend.name)
+                backend.is_active = True
+            else:
+                backend.is_active = False
+
+        for name, url in configured.items():
+            db.add(SnakedispatchBackend(name=name, url=url, is_active=True))
+
+        db.commit()
+
+        # Populate registry (needs DB ids for new backends)
+        backend_registry.clear()
+        for backend in db.scalars(
+            select(SnakedispatchBackend).where(SnakedispatchBackend.is_active.is_(True))
+        ).all():
+            backend_registry.register(backend.id, backend.name, backend.url)
+
+        # Startup health check (non-fatal)
+        for bid, client in backend_registry.all_clients().items():
+            name = backend_registry.get_name(bid)
+            try:
+                health = client.health_check()
+                logger.info(
+                    "Snakedispatch backend connected",
+                    extra={
+                        "backend_name": name,
+                        "status": health.get("status"),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "Snakedispatch backend unreachable at startup",
+                    extra={"backend_name": name, "error": str(e)},
+                )
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    logger.info(
+        "Starting PyPSA Web App API",
+        extra={
+            "version": __version__,
+            "api_prefix": API_V1_PREFIX,
+            "networks_path": str(settings.networks_path),
+            "database_url": settings.database_url,
+        },
+    )
+
+    # Ensure networks directory exists
+    settings.networks_path.mkdir(parents=True, exist_ok=True)
+
+    run_migrations()  # noqa: ASYNC240
+
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        logger.info("Database ready")
+        if settings.demo_mode:
+            ensure_demo_user(db)
+        elif not settings.auth_enabled:
+            ensure_system_user(db)
+    finally:
+        db.close()
+
+    if settings.auth_enabled:
+        if settings.auth_oauth_enabled:
+            logger.info(
+                "OAuth providers enabled: %s",
+                settings.enabled_oauth_providers,
+                extra={"session_ttl": settings.session_ttl},
+            )
+            build_oauth_clients(settings)
+
+        if settings.auth_password_enabled:
+            logger.info("Password authentication enabled")
+
+        # Verify Redis is available (required for session storage)
+        if not cache_service.ping():
+            msg = (
+                "Session based auth requires Redis. "
+                "Set REDIS_URL and ensure Redis is running."
+            )
+            raise RuntimeError(msg)
+
+        # Initialize session store
+        session.session_store = session.SessionStore()
+        logger.info(
+            "Session store initialized",
+            extra={"redis_url": settings.redis_url},
+        )
+    else:
+        logger.info("Authentication disabled")
+
+    # Backends must exist in DB before registry can map IDs to clients
+    if settings.resolved_backends:
+        _sync_backends()
+    else:
+        logger.info(
+            "No Snakedispatch backends configured (SNAKEDISPATCH_BACKENDS not set)"
+        )
+
+    sync_task = None
+    if settings.resolved_backends:
+        sync_task = asyncio.create_task(
+            run_sync_loop(interval=settings.snakedispatch_sync_interval)
+        )
+        logger.info(
+            "Background run sync started",
+            extra={"interval": settings.snakedispatch_sync_interval},
+        )
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down PyPSA Web App API")
+    if sync_task is not None:
+        sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sync_task
+        logger.info("Background run sync stopped")
+    engine.dispose()
+    logger.info("Shutdown complete")
+
+
+app = FastAPI(
+    title="PyPSA App",
+    version=__version__,
+    description=__description__,
+    openapi_url=f"{API_V1_PREFIX}/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
+
+# Add session middleware for OAuth state management
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret_key,
+    session_cookie="oauth_session",
+    max_age=600,  # OAuth state only needs to last 10 minutes
+    same_site="lax",
+    https_only=not settings.base_url.startswith("http://localhost"),
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_middleware(APIRateLimitMiddleware)
+
+
+@app.middleware("http")
+async def _attach_user_for_ratelimit(
+    request: Request,
+    call_next,  # noqa: ANN001
+) -> Response:
+    """Resolve identity once per request so the rate-limit key_func can see it."""
+    request.state.user = None
+    if not settings.auth_enabled or request.method == "OPTIONS":
+        return await call_next(request)
+    has_session = SESSION_COOKIE_NAME in request.cookies
+    auth_header = request.headers.get("authorization", "")
+    has_bearer = auth_header.lower().startswith("bearer ")
+    if not has_session and not has_bearer:
+        return await call_next(request)
+    try:
+        db = SessionLocal()
+        try:
+            request.state.user = resolve_current_user(request, db)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        # Route's auth dependency handles the status code
+        logger.warning("ratelimit user resolution failed", exc_info=True)
+    return await call_next(request)
+
+
+if settings.demo_mode:
+    _DEMO_POST_ALLOWLIST = frozenset(
+        {
+            f"{API_V1_PREFIX}/auth/login/password",
+            f"{API_V1_PREFIX}/plots/generate",
+            f"{API_V1_PREFIX}/plots/explore",
+            f"{API_V1_PREFIX}/statistics/",
+            f"{API_V1_PREFIX}/statistics",
+        }
+    )
+
+    @app.middleware("http")
+    async def _demo_readonly(
+        request: Request,
+        call_next,  # noqa: ANN001
+    ) -> JSONResponse:
+        if (
+            request.method not in ("GET", "HEAD", "OPTIONS")
+            and request.url.path not in _DEMO_POST_ALLOWLIST
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Demo deployment is read-only"},
+            )
+        return await call_next(request)
+
+
+cors_origins = [origin.strip() for origin in settings.cors_origins.split(",")]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+if settings.resolved_backends:
+
+    @app.exception_handler(SnakedispatchError)
+    async def snakedispatch_exception_handler(
+        request: Request, exc: SnakedispatchError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    if isinstance(exc, HTTPException):
+        raise exc
+
+    logger.error(  # noqa: TRY400
+        "Unexpected error",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "error": str(exc),
+            "error_type": exc.__class__.__name__,
+            "client_host": request.client.host if request.client else None,
+        },
+        exc_info=True,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred"},
+    )
+
+
+# Include routers
+app.include_router(auth.router, prefix=f"{API_V1_PREFIX}/auth", tags=["auth"])
+if settings.auth_enabled:
+    app.include_router(
+        api_keys.router, prefix=f"{API_V1_PREFIX}/auth/api-keys", tags=["auth"]
+    )
+    app.include_router(public.router, prefix=f"{API_V1_PREFIX}/public", tags=["public"])
+app.include_router(admin.router, prefix=f"{API_V1_PREFIX}/admin", tags=["admin"])
+app.include_router(
+    networks.router, prefix=f"{API_V1_PREFIX}/networks", tags=["networks"]
+)
+if not settings.demo_mode:
+    app.include_router(
+        networks_remote.router,
+        prefix=f"{API_V1_PREFIX}/networks",
+        tags=["networks"],
+    )
+app.include_router(plots.router, prefix=f"{API_V1_PREFIX}/plots", tags=["plots"])
+app.include_router(
+    statistics.router,
+    prefix=f"{API_V1_PREFIX}/statistics",
+    tags=["statistics"],
+)
+app.include_router(cache.router, prefix=f"{API_V1_PREFIX}/cache", tags=["cache"])
+app.include_router(version.router, prefix=f"{API_V1_PREFIX}/version", tags=["version"])
+app.include_router(tasks.router, prefix=f"{API_V1_PREFIX}/tasks", tags=["tasks"])
+if settings.resolved_backends or settings.demo_mode:
+    app.include_router(runs.router, prefix=f"{API_V1_PREFIX}/runs", tags=["runs"])
+
+
+# Health check endpoint
+@app.get("/health")
+def health_check() -> dict:
+    health_status: dict = {
+        "status": "healthy",
+        "version": __version__,
+        "cache": {"status": "unknown", "type": "redis"},
+    }
+
+    # Check cache health
+    try:
+        if cache_service.ping():
+            health_status["cache"]["status"] = "healthy"
+        else:
+            health_status["cache"]["status"] = "unhealthy"
+            health_status["status"] = "degraded"
+    except Exception as e:
+        logger.exception(
+            "Cache health check failed",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "cache_type": "redis",
+            },
+        )
+        health_status["cache"]["status"] = "unhealthy"
+        health_status["cache"]["error"] = str(e)
+        health_status["status"] = "degraded"
+
+    return health_status
+
+
+@app.get("/")
+def root() -> dict:
+    return {
+        "message": "PyPSA Web App API",
+        "version": __version__,
+        "docs": "/docs",
+    }
